@@ -21,6 +21,9 @@ pub struct Threshold
     // If present, this threshold will only apply to ip addresses of staked validators with stake <= this value
     pub high_stake : Option<u64>,
 
+    // Minimum number of events before the threshold is applied
+    pub min_value_count : Option<u64>,
+
     // If "sum", then the values will be summed before being compared against the threshold value; else if "average"
     // then the values will be averaged before being compared agains the threshold
     pub value_operation : ValueOperation,
@@ -28,9 +31,6 @@ pub struct Threshold
     // Comparison operation to use when comparing accumulated values for an ip address with the threshold value to
     // determine if the ip address has met the threshold and thus should be included in the group
     pub threshold_type : ThresholdType,
-
-    // Minimum number of events before the threshold is applied
-    pub min_value_count : Option<u64>,
 
     // The value to compare accumulated values to
     pub value : u64,

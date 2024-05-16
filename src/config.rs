@@ -2,6 +2,19 @@ use crate::classification::Classification;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+pub struct PubkeyClassification
+{
+    // If not provided, default of "known_pubkeys" is used
+    pub group_name : Option<String>,
+
+    // How long ip addresses that exceeded the threshold are held in the group before being expired out.  If not
+    // specified, a default value of 24 hours is used.  Thresholds may provide their own value.
+    pub group_expiration_seconds : Option<u64>,
+
+    pub pubkey : String
+}
+
+#[derive(Deserialize)]
 pub struct LeaderSlotsClassification
 {
     pub group_name : Option<String>,
@@ -12,6 +25,9 @@ pub struct LeaderSlotsClassification
 #[derive(Deserialize)]
 pub struct Config
 {
+    // Classification by known pubkey
+    pub known_pubkeys : Option<Vec<PubkeyClassification>>,
+
     pub failed_exceeded_quic_connections : Option<Classification>,
 
     // Threshold in number of milliseconds for a QUIC connection which submitted no tx before being closed, for

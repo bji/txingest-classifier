@@ -1,8 +1,12 @@
-use crate::{config::Config, group::Group};
+use crate::{
+    config::Config,
+    group::{Group, DEFAULT_GROUP_EXPIRATION_SECONDS}
+};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::str::FromStr;
 
 const DEFAULT_USELESS_QUIC_CONNECTION_DURATION_MS : u64 = 2 * 1000; // 2 seconds
 const TX_RETENTION_DURATION_MS : u64 = 2 * 60 * 1000; // 2 minutes
@@ -12,6 +16,9 @@ pub struct State
 {
     // Config is loaded from a file
     pub config : Config,
+
+    // HashMap derived from the pubkey config.  Map from Pubkey to (group_name, group_expiration_seconds).
+    pub pubkey_classifications : HashMap<Pubkey, (String, u64)>,
 
     // Fee that represents a tx that paid no fee
     pub zero_fee : Fee,
@@ -34,8 +41,11 @@ pub struct State
     // Current tx.  Tracked for 5 minutes after first seen.
     pub current_tx : HashMap<Signature, Tx>,
 
-    // Groups
-    pub groups : HashMap<String, Group>
+    // Pubkey groups.  Map from group name to map from ip_addr to expiration_ms.
+    pub pubkey_groups : HashMap<String, HashMap<IpAddr, u64>>,
+
+    // Classification groups
+    pub classification_groups : HashMap<String, Group>
 }
 
 #[derive(Default)]
@@ -46,9 +56,6 @@ pub struct Peer
 
     // Timestamp that an event was last seen from this peer
     pub most_recent_timestamp : u64,
-
-    // If the peer has an identity, this is it
-    pub identity : Option<Pubkey>,
 
     // Total number of tx submitted (votes + user)
     pub tx_submitted : u64
@@ -119,8 +126,31 @@ impl State
 {
     pub fn new(config : Config) -> Self
     {
+        // Create the pubkey_classifications
+        let pubkey_classifications = if let Some(known_pubkeys) = &config.known_pubkeys {
+            known_pubkeys
+                .iter()
+                .map(|c| {
+                    Pubkey::from_str(&c.pubkey).map(|pubkey| {
+                        (
+                            pubkey,
+                            (
+                                c.group_name.clone().unwrap_or("known_pubkeys".to_string()),
+                                c.group_expiration_seconds.unwrap_or(DEFAULT_GROUP_EXPIRATION_SECONDS)
+                            )
+                        )
+                    })
+                })
+                .flatten()
+                .collect()
+        }
+        else {
+            Default::default()
+        };
+
         Self {
             config,
+            pubkey_classifications,
             zero_fee : Fee { total : 0, cu_limit : 1, cu_used : 1 },
             most_recent_timestamp : 0,
             most_recent_timestamp_event_count : 0,
@@ -128,7 +158,8 @@ impl State
             peers : Default::default(),
             stakes : Default::default(),
             current_tx : Default::default(),
-            groups : Default::default()
+            pubkey_groups : Default::default(),
+            classification_groups : Default::default()
         }
     }
 
@@ -201,9 +232,33 @@ impl State
 
         peer.most_recent_timestamp = timestamp;
 
-        peer.identity = peer_pubkey;
-
         self.stakes.insert(peer_addr, stake);
+
+        // If there is a classification for this pubkey, then put it in the corresponding group
+        if let Some(peer_pubkey) = peer_pubkey {
+            if let Some((group_name, group_expiration)) = self.pubkey_classifications.get(&peer_pubkey) {
+                let new_expiration = timestamp + (group_expiration * 1000);
+                self.pubkey_groups
+                    .entry(group_name.clone())
+                    .or_default()
+                    .entry(peer_addr)
+                    .and_modify(|expiration| {
+                        if *expiration < new_expiration {
+                            *expiration = new_expiration;
+                            println!(
+                                "Update {peer_pubkey} to {group_name} at address {peer_addr} with expiration \
+                                 {new_expiration}"
+                            );
+                        }
+                    })
+                    .or_insert_with(|| {
+                        println!(
+                            "Add {peer_pubkey} to {group_name} at address {peer_addr} with expiration {new_expiration}"
+                        );
+                        new_expiration
+                    });
+            }
+        }
     }
 
     pub fn finished(
@@ -460,26 +515,38 @@ impl State
 
         // Do group periodic work
         if let Some(failed_exceeded_quic_connections) = &mut self.config.failed_exceeded_quic_connections {
-            failed_exceeded_quic_connections.periodic(&self.stakes, &mut self.groups, now);
+            failed_exceeded_quic_connections.periodic(&self.stakes, &mut self.classification_groups, now);
         }
 
         if let Some(useless_quic_connections) = &mut self.config.useless_quic_connections {
-            useless_quic_connections.periodic(&self.stakes, &mut self.groups, now);
+            useless_quic_connections.periodic(&self.stakes, &mut self.classification_groups, now);
         }
 
         if let Some(fee_lamports_submitted) = &mut self.config.fee_lamports_submitted {
-            fee_lamports_submitted.periodic(&self.stakes, &mut self.groups, now);
+            fee_lamports_submitted.periodic(&self.stakes, &mut self.classification_groups, now);
         }
 
         if let Some(fee_microlamports_per_cu_limit) = &mut self.config.fee_microlamports_per_cu_limit {
-            fee_microlamports_per_cu_limit.periodic(&self.stakes, &mut self.groups, now);
+            fee_microlamports_per_cu_limit.periodic(&self.stakes, &mut self.classification_groups, now);
         }
 
         if let Some(fee_microlamports_per_cu_used) = &mut self.config.fee_microlamports_per_cu_used {
-            fee_microlamports_per_cu_used.periodic(&self.stakes, &mut self.groups, now);
+            fee_microlamports_per_cu_used.periodic(&self.stakes, &mut self.classification_groups, now);
         }
 
-        for group in self.groups.values_mut() {
+        for (group_name, group) in &mut self.pubkey_groups {
+            group.retain(|ip_addr, expiration| {
+                if *expiration >= now {
+                    true
+                }
+                else {
+                    println!("Remove {ip_addr} from group {group_name}");
+                    false
+                }
+            });
+        }
+
+        for group in self.classification_groups.values_mut() {
             group.periodic(now);
         }
 
