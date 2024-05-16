@@ -15,10 +15,6 @@ pub struct Classification
     // specified, a default value of 24 hours is used.  Thresholds may provide their own value.
     pub group_expiration_seconds : Option<u64>,
 
-    // If this is present and true, then all thresholds will be evaluated no matter how many match.  If not present or
-    // false, then the first threshold which matches will stop evaluation of subsequent thresholds
-    pub evaluate_all_thresholds : Option<bool>,
-
     // The thresholds to apply
     pub thresholds : Vec<Threshold>,
 
@@ -107,9 +103,7 @@ impl Classification
         // the classification calls for stopping after the first matching threshold for an ip address
         for (ip_addr, recent_values) in &self.recent_values {
             for threshold in &mut self.thresholds {
-                if threshold.is_exceeded(stakes, now, ip_addr, recent_values, groups) &&
-                    !self.evaluate_all_thresholds.unwrap_or(false)
-                {
+                if threshold.stop_after_exceeded(stakes, now, ip_addr, recent_values, groups) {
                     break;
                 }
             }

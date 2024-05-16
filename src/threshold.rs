@@ -32,7 +32,11 @@ pub struct Threshold
     pub value : u64,
 
     // The time span in milliseconds over which to sum accumulated values to get the value to compare against
-    pub duration_ms : u64
+    pub duration_ms : u64,
+
+    // If present and false, then continue evaluating thresholds for ip addresses that matched this threshold for this
+    // classification
+    pub continue_after_match : Option<bool>
 }
 
 #[derive(Deserialize)]
@@ -93,7 +97,7 @@ impl Threshold
         Ok(())
     }
 
-    pub fn is_exceeded(
+    pub fn stop_after_exceeded(
         &mut self,
         stakes : &HashMap<IpAddr, u64>,
         now : u64,
@@ -156,7 +160,7 @@ impl Threshold
                 .entry(group_name.clone())
                 .or_insert_with(|| Group::new(group_name))
                 .add(ip_addr.clone(), now + self.group_expiration_seconds.unwrap());
-            true
+            !self.continue_after_match.unwrap_or(false)
         }
         else {
             false
