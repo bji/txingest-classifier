@@ -1,7 +1,4 @@
-use crate::{
-    config::{Config, LeaderSlotsClassification},
-    group::Group
-};
+use crate::{config::Config, group::Group};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::{HashMap, HashSet};
@@ -13,10 +10,11 @@ const PEER_RETENTION_DURATION_MS : u64 = 3 * 24 * 60 * 60 * 1000; // 3 days
 
 pub struct State
 {
+    // Config is loaded from a file
+    pub config : Config,
+
     // Fee that represents a tx that paid no fee
     pub zero_fee : Fee,
-
-    pub useless_quic_connection_duration_ms : u64,
 
     // Timestamp of most recent event
     pub most_recent_timestamp : u64,
@@ -33,22 +31,11 @@ pub struct State
     // Peer stake information
     pub stakes : HashMap<IpAddr, u64>,
 
-    pub failed_exceeded_quic_connections_group : Option<Group>,
-
-    pub useless_quic_connections_group : Option<Group>,
-
-    pub fee_lamports_submitted_group : Option<Group>,
-
-    // Not supported yet -- need to parse the cu limit out for all submitted tx in order to track this
-    // pub fee_microlamports_per_cu_limit_submitted_group : Option<Group>,
-    pub fee_microlamports_per_cu_limit_landed_group : Option<Group>,
-
-    pub fee_microlamports_per_cu_used_landed_group : Option<Group>,
-
-    pub outside_leader_slots : Option<LeaderSlotsClassification>,
-
     // Current tx.  Tracked for 5 minutes after first seen.
-    pub current_tx : HashMap<Signature, Tx>
+    pub current_tx : HashMap<Signature, Tx>,
+
+    // Groups
+    pub groups : HashMap<String, Group>
 }
 
 #[derive(Default)]
@@ -133,22 +120,15 @@ impl State
     pub fn new(config : Config) -> Self
     {
         Self {
+            config,
             zero_fee : Fee { total : 0, cu_limit : 1, cu_used : 1 },
-            useless_quic_connection_duration_ms : config
-                .useless_quic_connection_duration_ms
-                .unwrap_or(DEFAULT_USELESS_QUIC_CONNECTION_DURATION_MS),
             most_recent_timestamp : 0,
             most_recent_timestamp_event_count : 0,
             leader_status : None,
             peers : Default::default(),
             stakes : Default::default(),
-            failed_exceeded_quic_connections_group : Group::new_option(config.failed_exceeded_quic_connections),
-            useless_quic_connections_group : Group::new_option(config.useless_quic_connections),
-            fee_lamports_submitted_group : Group::new_option(config.fee_lamports_submitted),
-            fee_microlamports_per_cu_limit_landed_group : Group::new_option(config.fee_microlamports_per_cu_limit),
-            fee_microlamports_per_cu_used_landed_group : Group::new_option(config.fee_microlamports_per_cu_used),
-            outside_leader_slots : config.outside_leader_slots,
-            current_tx : Default::default()
+            current_tx : Default::default(),
+            groups : Default::default()
         }
     }
 
@@ -183,8 +163,8 @@ impl State
     {
         let timestamp = self.get_timestamp(timestamp);
 
-        if let Some(failed_exceeded_quic_connections_group) = &mut self.failed_exceeded_quic_connections_group {
-            failed_exceeded_quic_connections_group.add_value(peer_addr, timestamp, 1);
+        if let Some(failed_exceeded_quic_connections) = &mut self.config.failed_exceeded_quic_connections {
+            failed_exceeded_quic_connections.add_value(peer_addr, timestamp, 1);
         }
     }
 
@@ -237,11 +217,14 @@ impl State
         if let Some(peer) = self.peers.get_mut(&peer_addr) {
             peer.most_recent_timestamp = timestamp;
 
-            if let Some(useless_quic_connections_group) = &mut self.useless_quic_connections_group {
+            if let Some(useless_quic_connections) = &mut self.config.useless_quic_connections {
                 if (peer.tx_submitted == 0) &&
-                    ((timestamp - peer.first_timestamp) >= self.useless_quic_connection_duration_ms)
+                    ((timestamp - peer.first_timestamp) >=
+                        self.config
+                            .useless_quic_connection_duration_ms
+                            .unwrap_or(DEFAULT_USELESS_QUIC_CONNECTION_DURATION_MS))
                 {
-                    useless_quic_connections_group.add_value(peer_addr, timestamp, 1);
+                    useless_quic_connections.add_value(peer_addr, timestamp, 1);
                 }
             }
         }
@@ -328,7 +311,7 @@ impl State
         slots : u8
     )
     {
-        if let Some(outside_leader_slots) = &mut self.outside_leader_slots {
+        if let Some(outside_leader_slots) = &mut self.config.outside_leader_slots {
             if (slots as u64) >= outside_leader_slots.leader_slots {
                 self.end_leader(timestamp);
                 return;
@@ -345,7 +328,7 @@ impl State
         _timestamp : u64
     )
     {
-        if !self.outside_leader_slots.is_some() || !self.leader_status.unwrap_or(false) {
+        if !self.config.outside_leader_slots.is_some() || !self.leader_status.unwrap_or(false) {
             println!("LEADER CLASSIFICATION");
             self.leader_status = Some(true);
         }
@@ -356,7 +339,7 @@ impl State
         timestamp : u64
     )
     {
-        if self.outside_leader_slots.is_some() {
+        if self.config.outside_leader_slots.is_some() {
             if self.leader_status.unwrap_or(true) {
                 // If currently in leader state
                 println!("NOT LEADER CLASSIFICATION");
@@ -450,22 +433,18 @@ impl State
                     // Only the first submission gets the fee; everything else gets zero_fee (or if the tx never
                     // landed, of course the submission gets zero_fee)
                     let fee = if i == 0 { tx.fee.as_ref().unwrap_or(&self.zero_fee) } else { &self.zero_fee };
-                    if let Some(fee_lamports_submitted_group) = &mut self.fee_lamports_submitted_group {
-                        fee_lamports_submitted_group.add_value(submission.submitter, submission.timestamp, fee.total);
+                    if let Some(fee_lamports_submitted) = &mut self.config.fee_lamports_submitted {
+                        fee_lamports_submitted.add_value(submission.submitter, submission.timestamp, fee.total);
                     }
-                    if let Some(fee_microlamports_per_cu_limit_landed_group) =
-                        &mut self.fee_microlamports_per_cu_limit_landed_group
-                    {
-                        fee_microlamports_per_cu_limit_landed_group.add_value(
+                    if let Some(fee_microlamports_per_cu_limit) = &mut self.config.fee_microlamports_per_cu_limit {
+                        fee_microlamports_per_cu_limit.add_value(
                             submission.submitter,
                             submission.timestamp,
                             (fee.total * 1000) / fee.cu_limit
                         );
                     }
-                    if let Some(fee_microlamports_per_cu_used_landed_group) =
-                        &mut self.fee_microlamports_per_cu_used_landed_group
-                    {
-                        fee_microlamports_per_cu_used_landed_group.add_value(
+                    if let Some(fee_microlamports_per_cu_used) = &mut self.config.fee_microlamports_per_cu_used {
+                        fee_microlamports_per_cu_used.add_value(
                             submission.submitter,
                             submission.timestamp,
                             (fee.total * 1000) / fee.cu_used
@@ -480,25 +459,28 @@ impl State
         });
 
         // Do group periodic work
-        if let Some(failed_exceeded_quic_connections_group) = &mut self.failed_exceeded_quic_connections_group {
-            failed_exceeded_quic_connections_group.periodic(&self.stakes, now);
+        if let Some(failed_exceeded_quic_connections) = &mut self.config.failed_exceeded_quic_connections {
+            failed_exceeded_quic_connections.periodic(&self.stakes, &mut self.groups, now);
         }
 
-        if let Some(useless_quic_connections_group) = &mut self.useless_quic_connections_group {
-            useless_quic_connections_group.periodic(&self.stakes, now);
+        if let Some(useless_quic_connections) = &mut self.config.useless_quic_connections {
+            useless_quic_connections.periodic(&self.stakes, &mut self.groups, now);
         }
 
-        if let Some(fee_lamports_submitted_group) = &mut self.fee_lamports_submitted_group {
-            fee_lamports_submitted_group.periodic(&self.stakes, now);
+        if let Some(fee_lamports_submitted) = &mut self.config.fee_lamports_submitted {
+            fee_lamports_submitted.periodic(&self.stakes, &mut self.groups, now);
         }
 
-        if let Some(fee_microlamports_per_cu_limit_landed_group) = &mut self.fee_microlamports_per_cu_limit_landed_group
-        {
-            fee_microlamports_per_cu_limit_landed_group.periodic(&self.stakes, now);
+        if let Some(fee_microlamports_per_cu_limit) = &mut self.config.fee_microlamports_per_cu_limit {
+            fee_microlamports_per_cu_limit.periodic(&self.stakes, &mut self.groups, now);
         }
 
-        if let Some(fee_microlamports_per_cu_used_landed_group) = &mut self.fee_microlamports_per_cu_used_landed_group {
-            fee_microlamports_per_cu_used_landed_group.periodic(&self.stakes, now);
+        if let Some(fee_microlamports_per_cu_used) = &mut self.config.fee_microlamports_per_cu_used {
+            fee_microlamports_per_cu_used.periodic(&self.stakes, &mut self.groups, now);
+        }
+
+        for group in self.groups.values_mut() {
+            group.periodic(now);
         }
 
         // Remove peers whose most recent timestamp is older than 3 days old
