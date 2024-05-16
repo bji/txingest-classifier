@@ -21,6 +21,10 @@ pub struct Threshold
     // If present, this threshold will only apply to ip addresses of staked validators with stake <= this value
     pub high_stake : Option<u64>,
 
+    // If "sum", then the values will be summed before being compared against the threshold value; else if "average"
+    // then the values will be averaged before being compared agains the threshold
+    pub value_operation : ValueOperation,
+
     // Comparison operation to use when comparing accumulated values for an ip address with the threshold value to
     // determine if the ip address has met the threshold and thus should be included in the group
     pub threshold_type : ThresholdType,
@@ -31,7 +35,8 @@ pub struct Threshold
     // The value to compare accumulated values to
     pub value : u64,
 
-    // The time span in milliseconds over which to sum accumulated values to get the value to compare against
+    // The time span in milliseconds over which to sum or average accumulated values to get the value to compare
+    // against
     pub duration_ms : u64,
 
     // If present and false, then continue evaluating thresholds for ip addresses that matched this threshold for this
@@ -57,6 +62,16 @@ pub enum ThresholdType
     // If the value is lower than or equal to the threshold, then it meets the classification criteria
     #[serde(rename = "less_than_or_equal_to")]
     LessThanOrEqual
+}
+
+#[derive(Deserialize)]
+pub enum ValueOperation
+{
+    #[serde(rename = "sum")]
+    Sum,
+
+    #[serde(rename = "average")]
+    Average
 }
 
 impl Threshold
@@ -128,7 +143,7 @@ impl Threshold
 
         // Sum values for relevant timestamps
         let mut value_count = 0;
-        let value_sum = recent_values
+        let mut value_sum = recent_values
             .iter()
             .filter_map(|timestamped_value| {
                 if timestamped_value.timestamp < use_timestamp {
@@ -145,6 +160,15 @@ impl Threshold
             if value_count < min_value_count {
                 return false;
             }
+        }
+
+        match self.value_operation {
+            ValueOperation::Sum => (),
+            ValueOperation::Average => {
+                if value_count > 0 {
+                    value_sum /= value_count
+                }
+            },
         }
 
         let is_in_group = match self.threshold_type {
