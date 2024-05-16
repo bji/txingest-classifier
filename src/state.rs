@@ -24,8 +24,8 @@ pub struct State
     // Number of events at the most recent timestamp
     pub most_recent_timestamp_event_count : u16,
 
-    // Leader status -- how many slots until leader -- None until known
-    pub leader_status : Option<LeaderStatus>,
+    // Leader status -- Some(true) if leader, Some(false) if not; None until known
+    pub leader_status : Option<bool>,
 
     // Mapping from IP address to the Peer struct that records peer specific data
     pub peers : HashMap<IpAddr, Peer>,
@@ -126,18 +126,6 @@ pub struct Fee
     pub cu_limit : u64,
 
     pub cu_used : u64
-}
-
-pub enum LeaderStatus
-{
-    // Not leader and not going to be leader soon
-    NotSoon,
-
-    // Upcoming in a given number of slots; the validator only reports upcoming within 200 slots of leader slots
-    Upcoming(u64),
-
-    // Now leader
-    Leader
 }
 
 impl State
@@ -340,31 +328,26 @@ impl State
         slots : u8
     )
     {
-        self.get_timestamp(timestamp);
-
-        self.leader_status = Some(LeaderStatus::Upcoming(slots as u64));
-
         if let Some(outside_leader_slots) = &mut self.outside_leader_slots {
             if (slots as u64) >= outside_leader_slots.leader_slots {
-                println!("NOT LEADER CLASSIFICATION");
-            }
-            else {
-                println!("LEADER CLASSIFICATION");
+                self.end_leader(timestamp);
+                return;
             }
         }
+        // If leader slots aren't being tracked, then use begin_leader to ensure that peers are treated as if we're
+        // leader and not blocked just because we're outside of leader slots
+
+        self.begin_leader(timestamp);
     }
 
     pub fn begin_leader(
         &mut self,
-        timestamp : u64
+        _timestamp : u64
     )
     {
-        self.get_timestamp(timestamp);
-
-        self.leader_status = Some(LeaderStatus::Leader);
-
-        if self.outside_leader_slots.is_some() {
+        if !self.outside_leader_slots.is_some() || !self.leader_status.unwrap_or(false) {
             println!("LEADER CLASSIFICATION");
+            self.leader_status = Some(true);
         }
     }
 
@@ -373,12 +356,17 @@ impl State
         timestamp : u64
     )
     {
-        self.get_timestamp(timestamp);
-
-        self.leader_status = Some(LeaderStatus::NotSoon);
-
         if self.outside_leader_slots.is_some() {
-            println!("NOT LEADER CLASSIFICATION");
+            if self.leader_status.unwrap_or(true) {
+                // If currently in leader state
+                println!("NOT LEADER CLASSIFICATION");
+                self.leader_status = Some(false);
+            }
+        }
+        // If leader slots aren't being tracked, then use begin_leader to ensure that peers are treated as if we're
+        // leader and not blocked just because we're outside of leader slots
+        else {
+            self.begin_leader(timestamp);
         }
     }
 
@@ -391,6 +379,12 @@ impl State
     {
         // Convert now into a timestamp
         let now = self.get_timestamp(now);
+
+        // If the leader_status classification has not happened yet, then we've just started up and haven't been
+        // told anything about leader slots, so should assume we're outside of leader slots
+        if self.leader_status.is_none() {
+            self.end_leader(now);
+        }
 
         //        // If it's time for a new period, then use recent_fees to produce a new avg_fees
         //        if let Some(period_start) = self.period_start {
