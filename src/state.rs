@@ -1,32 +1,22 @@
-use crate::config::Config;
+use crate::{
+    config::{Config, LeaderSlotsClassification},
+    group::Group
+};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::rc::Rc;
 
-// xxx really want to evaluate in the time range leading up to and including leader slots.
-//
-// Threshold is:
-// - Per second
-// - Or 4x threshold over 6 seconds
-// - Or 6x threshold over 12 seconds
+const DEFAULT_USELESS_QUIC_CONNECTION_DURATION_MS : u64 = 2 * 1000; // 2 seconds
+const TX_RETENTION_DURATION_MS : u64 = 2 * 60 * 1000; // 2 minutes
+const PEER_RETENTION_DURATION_MS : u64 = 3 * 24 * 60 * 60 * 1000; // 3 days
 
-// To track:
-
-// Stake levels of peers
-// failed + exceeded counts since last periodic
-//    + deque with summary per second
-// closed QUIC connections with no tx since last periodic
-//    + deque with summary per second
-//
-//
-
-#[derive(Default)]
 pub struct State
 {
-    pub config : Config,
+    // Fee that represents a tx that paid no fee
+    pub zero_fee : Fee,
+
+    pub useless_quic_connection_duration_ms : u64,
 
     // Timestamp of most recent event
     pub most_recent_timestamp : u64,
@@ -37,112 +27,95 @@ pub struct State
     // Leader status -- how many slots until leader -- None until known
     pub leader_status : Option<LeaderStatus>,
 
-    // Timestamps of failures
-    pub failures : HashMap<IpAddr, VecDeque<u64>>,
-
     // Mapping from IP address to the Peer struct that records peer specific data
     pub peers : HashMap<IpAddr, Peer>,
 
-    // Current tx.  Tracked for 5 minutes after last seen.
-    pub current_tx : HashMap<Signature, Rc<RefCell<Tx>>>,
+    // Peer stake information
+    pub stakes : HashMap<IpAddr, u64>,
 
-    // Timestamp of most recent 6 second period
-    pub period_start : Option<u64>,
+    pub failed_exceeded_quic_connections_group : Option<Group>,
 
-    // Total fee of most recent period
-    pub recent_fees : Fee,
+    pub useless_quic_connections_group : Option<Group>,
 
-    // Average fee per tx + avg fee per cu per tx landed per 6 second interval for the previous 1 day
-    // Timestamp on the fee is the
-    pub avg_fees : VecDeque<TimestampedFee>,
+    pub fee_lamports_submitted_group : Option<Group>,
 
-    // Peers in the failed_exceeded_quic_threshold_set, map from IpAddr to timestamp of when put into set
-    pub failed_exceeded_quic_threshold_set : HashMap<IpAddr, u64>,
+    // Not supported yet -- need to parse the cu limit out for all submitted tx in order to track this
+    // pub fee_microlamports_per_cu_limit_submitted_group : Option<Group>,
+    pub fee_microlamports_per_cu_limit_landed_group : Option<Group>,
 
-    pub useless_quic_threshold_set : HashMap<IpAddr, u64>,
+    pub fee_microlamports_per_cu_used_landed_group : Option<Group>,
 
-    // Peers in the threshold for "worst landed %"
-    pub landed_pct_threshold_set : HashMap<IpAddr, u64>,
+    pub outside_leader_slots : Option<LeaderSlotsClassification>,
 
-    // Peers in the threshold for "worst exclusive %"
-    pub exclusive_pct_threshold_set : HashMap<IpAddr, u64>,
-
-    // Peers in the threshold for "lowest fee per landed tx"
-    pub fee_per_landed_tx_threshold_set : HashMap<IpAddr, u64>,
-
-    // Peers in the threshold for "lowest fee per submitted tx"
-    pub fee_per_submitted_tx_threshold_set : HashMap<IpAddr, u64>,
-
-    // Peers in the threshold for "lowest fee/CU per landed tx"
-    pub fee_per_cu_per_landed_tx_threshold_set : HashMap<IpAddr, u64>,
-
-    // Peers in the threshold for "lowest fee/CU per submitted tx"
-    pub fee_per_cu_per_submitted_tx_threshold_set : HashMap<IpAddr, u64>,
-
-    // Peers in the number of slots before leader slots to apply the "outside leader slots" classifications.  If not
-    // present, then leader slot based classification is not done
-    pub leader_slot_classification_threshold_set : HashMap<IpAddr, u64>
+    // Current tx.  Tracked for 5 minutes after first seen.
+    pub current_tx : HashMap<Signature, Tx>
 }
 
 #[derive(Default)]
 pub struct Peer
 {
+    // Timestamp of first event seen from this peer
+    pub first_timestamp : u64,
+
     // Timestamp that an event was last seen from this peer
-    pub timestamp : u64,
+    pub most_recent_timestamp : u64,
 
     // If the peer has an identity, this is it
     pub identity : Option<Pubkey>,
 
-    // Stake level of peer
-    pub stake : u64,
-
-    // Total number of vote tx submitted
-    pub vote_tx_submitted : u64,
-
-    // Total number of user tx submitted
-    pub user_tx_submitted : u64,
-
-    // Recent QUIC connections.  This is the timestamp of the QUIC connection closing.
-    pub connections : VecDeque<u64>,
-
-    // Recent "useless QUIC connections", which are those which were closed by the remote peer and never submitted a
-    // tx, or were closed by the local peer, lived at least 6 seconds, and never submitted a tx.  This is the
-    // timestamp of the QUIC connection closing.
-    pub useless_connections : VecDeque<u64>,
-
-    // Tx submitted within the previous 6 seconds
-    pub tx : VecDeque<SubmittedTx>
-}
-
-#[derive(Default)]
-pub struct StakeLevel
-{
-    // Timestamp of most recent event seen for this peer
-    pub timestamp : u64,
-
-    // Stake level
-    pub stake : u64
+    // Total number of tx submitted (votes + user)
+    pub tx_submitted : u64
 }
 
 #[derive(Default)]
 pub struct Tx
 {
-    // Timestamp that the tx was most recently seen
-    pub timestamp : u64,
-
-    // Set of peers who submitted this tx
+    // Submitters
     pub submitters : HashSet<IpAddr>,
+
+    // Submitters of the tx, in order of first submission
+    pub submissions : Vec<SubmittedTx>,
 
     // Fee paid by the tx, if known
     pub fee : Option<Fee>
 }
 
-#[derive(Default)]
 pub struct SubmittedTx
 {
     pub timestamp : u64,
 
-    pub tx : Rc<RefCell<Tx>>
+    pub submitter : IpAddr
+}
+
+impl Tx
+{
+    pub fn new(
+        timestamp : u64,
+        first_submitter : IpAddr
+    ) -> Self
+    {
+        Self {
+            submitters : vec![first_submitter].into_iter().collect(),
+            submissions : vec![SubmittedTx { timestamp, submitter : first_submitter.clone() }],
+            fee : None
+        }
+    }
+
+    pub fn submitted(
+        &mut self,
+        timestamp : u64,
+        submitter : IpAddr
+    )
+    {
+        // If it's already been submitted by this submitter, then nothing more to do
+        if self.submitters.contains(&submitter) {
+            return;
+        }
+
+        self.submitters.insert(submitter);
+
+        self.submissions.push(SubmittedTx { timestamp, submitter : submitter.clone() });
+    }
 }
 
 #[derive(Default)]
@@ -153,14 +126,6 @@ pub struct Fee
     pub cu_limit : u64,
 
     pub cu_used : u64
-}
-
-#[derive(Default)]
-pub struct TimestampedFee
-{
-    pub timestamp : u64,
-
-    pub fee : Fee
 }
 
 pub enum LeaderStatus
@@ -179,7 +144,24 @@ impl State
 {
     pub fn new(config : Config) -> Self
     {
-        Self { config, ..State::default() }
+        Self {
+            zero_fee : Fee { total : 0, cu_limit : 1, cu_used : 1 },
+            useless_quic_connection_duration_ms : config
+                .useless_quic_connection_duration_ms
+                .unwrap_or(DEFAULT_USELESS_QUIC_CONNECTION_DURATION_MS),
+            most_recent_timestamp : 0,
+            most_recent_timestamp_event_count : 0,
+            leader_status : None,
+            peers : Default::default(),
+            stakes : Default::default(),
+            failed_exceeded_quic_connections_group : Group::new_option(config.failed_exceeded_quic_connections),
+            useless_quic_connections_group : Group::new_option(config.useless_quic_connections),
+            fee_lamports_submitted_group : Group::new_option(config.fee_lamports_submitted),
+            fee_microlamports_per_cu_limit_landed_group : Group::new_option(config.fee_microlamports_per_cu_limit),
+            fee_microlamports_per_cu_used_landed_group : Group::new_option(config.fee_microlamports_per_cu_used),
+            outside_leader_slots : config.outside_leader_slots,
+            current_tx : Default::default()
+        }
     }
 
     // Gets the timestamp to use given the reported timestamp of an event
@@ -202,28 +184,7 @@ impl State
             self.most_recent_timestamp_event_count = 0;
         }
 
-        if self.period_start.is_none() {
-            self.period_start = Some(self.most_recent_timestamp);
-        }
-
         self.most_recent_timestamp
-    }
-
-    fn get_tx(
-        &mut self,
-        timestamp : u64,
-        signature : Signature,
-        submitter : IpAddr
-    ) -> Rc<RefCell<Tx>>
-    {
-        self.current_tx
-            .entry(signature)
-            .and_modify(|tx| {
-                tx.borrow_mut().timestamp = timestamp;
-                let _ = tx.borrow_mut().submitters.insert(submitter);
-            })
-            .or_insert_with(|| Rc::new(RefCell::new(Tx { timestamp, submitters : [submitter].into(), fee : None })))
-            .clone()
     }
 
     pub fn failed(
@@ -234,7 +195,9 @@ impl State
     {
         let timestamp = self.get_timestamp(timestamp);
 
-        self.failures.entry(peer_addr).or_default().push_back(timestamp);
+        if let Some(failed_exceeded_quic_connections_group) = &mut self.failed_exceeded_quic_connections_group {
+            failed_exceeded_quic_connections_group.add_value(peer_addr, timestamp, 1);
+        }
     }
 
     pub fn exceeded(
@@ -262,13 +225,17 @@ impl State
     {
         let timestamp = self.get_timestamp(timestamp);
 
-        let peer = self.peers.entry(peer_addr).or_default();
+        let peer = self.peers.entry(peer_addr.clone()).or_insert_with(|| Peer {
+            first_timestamp : timestamp,
+            most_recent_timestamp : timestamp,
+            ..Peer::default()
+        });
 
-        peer.timestamp = timestamp;
+        peer.most_recent_timestamp = timestamp;
 
         peer.identity = peer_pubkey;
 
-        peer.stake = stake;
+        self.stakes.insert(peer_addr, stake);
     }
 
     pub fn finished(
@@ -280,9 +247,14 @@ impl State
         let timestamp = self.get_timestamp(timestamp);
 
         if let Some(peer) = self.peers.get_mut(&peer_addr) {
-            peer.connections.push_back(timestamp);
-            if (peer.vote_tx_submitted == 0) && (peer.user_tx_submitted == 0) {
-                peer.useless_connections.push_back(timestamp);
+            peer.most_recent_timestamp = timestamp;
+
+            if let Some(useless_quic_connections_group) = &mut self.useless_quic_connections_group {
+                if (peer.tx_submitted == 0) &&
+                    ((timestamp - peer.first_timestamp) >= self.useless_quic_connection_duration_ms)
+                {
+                    useless_quic_connections_group.add_value(peer_addr, timestamp, 1);
+                }
             }
         }
     }
@@ -296,9 +268,9 @@ impl State
         let timestamp = self.get_timestamp(timestamp);
 
         if let Some(peer) = self.peers.get_mut(&peer_addr) {
-            peer.timestamp = timestamp;
+            peer.most_recent_timestamp = timestamp;
 
-            peer.vote_tx_submitted += 1;
+            peer.tx_submitted += 1;
         }
     }
 
@@ -311,15 +283,20 @@ impl State
     {
         let timestamp = self.get_timestamp(timestamp);
 
-        let tx = self.get_tx(timestamp, signature, peer_addr.clone());
-
         if let Some(peer) = self.peers.get_mut(&peer_addr) {
-            peer.timestamp = timestamp;
+            peer.most_recent_timestamp = timestamp;
 
-            peer.user_tx_submitted += 1;
-
-            peer.tx.push_back(SubmittedTx { timestamp, tx });
+            peer.tx_submitted += 1;
         }
+
+        // Only if this is the first time this peer has submitted this tx should the submitter be added to the
+        // submissions list; all other submissions by the same peer are just re-submissions and are not accounted for,
+        // so as not to count every one as a no-fee submitted tx which would lower the average tx fee rate for the
+        // submitter
+        self.current_tx
+            .entry(signature)
+            .and_modify(|tx| tx.submitted(timestamp, peer_addr))
+            .or_insert_with(|| Tx::new(timestamp, peer_addr));
     }
 
     pub fn forwarded(
@@ -353,12 +330,8 @@ impl State
         self.get_timestamp(timestamp);
 
         if let Some(tx) = self.current_tx.get_mut(&signature) {
-            tx.borrow_mut().fee = Some(Fee { total : fee, cu_limit, cu_used });
+            tx.fee = Some(Fee { total : fee, cu_limit, cu_used });
         }
-
-        self.recent_fees.total += fee;
-        self.recent_fees.cu_limit += cu_limit;
-        self.recent_fees.cu_used += cu_used;
     }
 
     pub fn will_be_leader(
@@ -371,8 +344,8 @@ impl State
 
         self.leader_status = Some(LeaderStatus::Upcoming(slots as u64));
 
-        if let Some(leader_slot_classification_threshold) = self.config.leader_slot_classification_threshold {
-            if (slots as u64) > leader_slot_classification_threshold {
+        if let Some(outside_leader_slots) = &mut self.outside_leader_slots {
+            if (slots as u64) >= outside_leader_slots.leader_slots {
                 println!("NOT LEADER CLASSIFICATION");
             }
             else {
@@ -390,7 +363,7 @@ impl State
 
         self.leader_status = Some(LeaderStatus::Leader);
 
-        if self.config.leader_slot_classification_threshold.is_some() {
+        if self.outside_leader_slots.is_some() {
             println!("LEADER CLASSIFICATION");
         }
     }
@@ -404,7 +377,7 @@ impl State
 
         self.leader_status = Some(LeaderStatus::NotSoon);
 
-        if self.config.leader_slot_classification_threshold.is_some() {
+        if self.outside_leader_slots.is_some() {
             println!("NOT LEADER CLASSIFICATION");
         }
     }
@@ -416,104 +389,134 @@ impl State
         now : u64
     )
     {
-        let five_minutes_ago = now - (5 * 60 * 1000);
+        // Convert now into a timestamp
+        let now = self.get_timestamp(now);
 
-        // If it's time for a new period, then use recent_fees to produce a new avg_fees
-        if let Some(period_start) = self.period_start {
-            let next_period_start = period_start + (6 * 1000);
-            if now < next_period_start {
-                // If the current period has not completed, nothing more to do in this function
-                return;
-            }
-            let duration = (now - period_start) / 1000;
-            self.avg_fees.push_back(TimestampedFee {
-                timestamp : now,
-                fee : Fee {
-                    total : self.recent_fees.total / duration,
-                    cu_limit : self.recent_fees.cu_limit / duration,
-                    cu_used : self.recent_fees.cu_used / duration
-                }
-            });
-            // Only allow as many 6 second periods as will fit into 24 hours
-            while self.avg_fees.len() > ((24 * 60 * 60) / 6) {
-                self.avg_fees.pop_front();
-            }
-            self.recent_fees = Fee::default();
-            self.period_start = Some(now);
-        }
-        else {
-            // If no current period has started, nothing more to do in this function
-            return;
-        }
+        //        // If it's time for a new period, then use recent_fees to produce a new avg_fees
+        //        if let Some(period_start) = self.period_start {
+        //            let next_period_start = period_start + PERIOD_DURATION_MS;
+        //            if now < next_period_start {
+        //                // If the current period has not completed, nothing more to do in this function
+        //                return;
+        //            }
+        //            let duration = (now - period_start) / 1000;
+        //            self.avg_fees.push_back(TimestampedFee {
+        //                timestamp : now,
+        //                fee : Fee {
+        //                    total : self.recent_fees.total / duration,
+        //                    cu_limit : self.recent_fees.cu_limit / duration,
+        //                    cu_used : self.recent_fees.cu_used / duration
+        //                }
+        //            });
+        //            // Only allow as many 6 second periods as will fit into 24 hours
+        //            while self.avg_fees.len() > ((24 * 60 * 60) / 6) {
+        //                self.avg_fees.pop_front();
+        //            }
+        //            self.recent_fees = Fee::default();
+        //            self.period_start = Some(now);
+        //        }
+        //        else {
+        //            // If no current period has started, nothing more to do in this function
+        //            return;
+        //        }
+        //
+        //        // Getting to this point means that a period has just completed, so re-evaluate all sets
+        //        let avg_fees_seconds = (self.avg_fees.len() as u64) * 6;
+        //
+        //        // Compute average fee over the previous 1 day
+        //        let (avg_fee, avg_cu_limit, avg_cu_used) = if avg_fees_seconds > 0 {
+        //            let mut total_fee = 0_u64;
+        //            let mut total_cu_limit = 0_u64;
+        //            let mut total_cu_used = 0_u64;
+        //
+        //            for fee in &self.avg_fees {
+        //                total_fee += fee.fee.total;
+        //                total_cu_limit += fee.fee.cu_limit;
+        //                total_cu_used += fee.fee.cu_used;
+        //            }
+        //            (total_fee / avg_fees_seconds, total_cu_limit / avg_fees_seconds, total_cu_used / avg_fees_seconds)
+        //        }
+        //        else {
+        //            (0, 0, 0)
+        //        };
+        //
+        //        println!("Avg Fee: {avg_fee}");
+        //        println!("Avg CU Limit: {avg_cu_limit}");
+        //        println!("Avg CU Used: {avg_cu_used}");
+        //        println!("Avg Fee/CU Limit: {:0.9}", (avg_fee as f64) / (avg_cu_limit as f64));
+        //        println!("Avg Fee/CU Used: {:0.9}", (avg_fee as f64) / (avg_cu_used as f64));
 
-        // Getting to this point means that a period has just completed, so re-evaluate all sets
-        let avg_fees_seconds = (self.avg_fees.len() as u64) * 6;
-
-        // Compute average fee over the previous 1 day
-        let (avg_fee, avg_cu_limit, avg_cu_used) = if avg_fees_seconds > 0 {
-            let mut total_fee = 0_u64;
-            let mut total_cu_limit = 0_u64;
-            let mut total_cu_used = 0_u64;
-
-            for fee in &self.avg_fees {
-                total_fee += fee.fee.total;
-                total_cu_limit += fee.fee.cu_limit;
-                total_cu_used += fee.fee.cu_used;
-            }
-            (total_fee / avg_fees_seconds, total_cu_limit / avg_fees_seconds, total_cu_used / avg_fees_seconds)
-        }
-        else {
-            (0, 0, 0)
-        };
-
-        println!("Avg Fee: {avg_fee}");
-        println!("Avg CU Limit: {avg_cu_limit}");
-        println!("Avg CU Used: {avg_cu_used}");
-        println!("Avg Fee/CU Limit: {:0.9}", (avg_fee as f64) / (avg_cu_limit as f64));
-        println!("Avg Fee/CU Used: {:0.9}", (avg_fee as f64) / (avg_cu_used as f64));
-
-        // Process peers - remove connection timestamps for connections which finished more than 1 day ago
-        let one_day_ago = now - (24 * 60 * 60 * 1000);
-
-        for (ip_addr, peer) in &mut self.peers {
-            // Remove old connections and useless_connections
-            loop {
-                if let Some(front) = peer.connections.front() {
-                    if *front < one_day_ago {
-                        peer.connections.pop_front();
+        // Remove tx that are old enough that they must have already landed if they're ever going to land,
+        // and when removing them, add their fee details into groups.
+        let retain_timestamp = now - TX_RETENTION_DURATION_MS;
+        self.current_tx.retain(|_, tx| {
+            if tx.submissions[0].timestamp < retain_timestamp {
+                for i in 0..tx.submissions.len() {
+                    let submission = &tx.submissions[i];
+                    // Only the first submission gets the fee; everything else gets zero_fee (or if the tx never
+                    // landed, of course the submission gets zero_fee)
+                    let fee = if i == 0 { tx.fee.as_ref().unwrap_or(&self.zero_fee) } else { &self.zero_fee };
+                    if let Some(fee_lamports_submitted_group) = &mut self.fee_lamports_submitted_group {
+                        fee_lamports_submitted_group.add_value(submission.submitter, submission.timestamp, fee.total);
                     }
-                    else {
-                        break;
+                    if let Some(fee_microlamports_per_cu_limit_landed_group) =
+                        &mut self.fee_microlamports_per_cu_limit_landed_group
+                    {
+                        fee_microlamports_per_cu_limit_landed_group.add_value(
+                            submission.submitter,
+                            submission.timestamp,
+                            (fee.total * 1000) / fee.cu_limit
+                        );
+                    }
+                    if let Some(fee_microlamports_per_cu_used_landed_group) =
+                        &mut self.fee_microlamports_per_cu_used_landed_group
+                    {
+                        fee_microlamports_per_cu_used_landed_group.add_value(
+                            submission.submitter,
+                            submission.timestamp,
+                            (fee.total * 1000) / fee.cu_used
+                        );
                     }
                 }
-                else {
-                    break;
-                }
-            }
-            loop {
-                if let Some(front) = peer.useless_connections.front() {
-                    if *front < one_day_ago {
-                        peer.useless_connections.pop_front();
-                    }
-                    else {
-                        break;
-                    }
-                }
-                else {
-                    break;
-                }
-            }
-            // Compute percent useless connections over the previous 1 day
-            if peer.connections.len() > 0 {
-                let percent_useless = (peer.useless_connections.len() as f64) / (peer.connections.len() as f64);
-                println!("{ip_addr} useless percent: {:0.3}", percent_useless * 100.0);
+                false
             }
             else {
-                println!("{ip_addr} useless percent: N/A");
+                true
             }
+        });
+
+        // Do group periodic work
+        if let Some(failed_exceeded_quic_connections_group) = &mut self.failed_exceeded_quic_connections_group {
+            failed_exceeded_quic_connections_group.periodic(&self.stakes, now);
         }
 
-        // Remove tx older than 5 minutes old
-        self.current_tx.retain(|_, tx| tx.borrow().timestamp >= five_minutes_ago);
+        if let Some(useless_quic_connections_group) = &mut self.useless_quic_connections_group {
+            useless_quic_connections_group.periodic(&self.stakes, now);
+        }
+
+        if let Some(fee_lamports_submitted_group) = &mut self.fee_lamports_submitted_group {
+            fee_lamports_submitted_group.periodic(&self.stakes, now);
+        }
+
+        if let Some(fee_microlamports_per_cu_limit_landed_group) = &mut self.fee_microlamports_per_cu_limit_landed_group
+        {
+            fee_microlamports_per_cu_limit_landed_group.periodic(&self.stakes, now);
+        }
+
+        if let Some(fee_microlamports_per_cu_used_landed_group) = &mut self.fee_microlamports_per_cu_used_landed_group {
+            fee_microlamports_per_cu_used_landed_group.periodic(&self.stakes, now);
+        }
+
+        // Remove peers whose most recent timestamp is older than 3 days old
+        let retain_timestamp = now - PEER_RETENTION_DURATION_MS;
+        self.peers.retain(|ip_addr, peer| {
+            if peer.most_recent_timestamp < retain_timestamp {
+                self.stakes.remove(ip_addr);
+                false
+            }
+            else {
+                true
+            }
+        });
     }
 }

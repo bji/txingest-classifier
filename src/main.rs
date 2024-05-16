@@ -1,4 +1,5 @@
 mod config;
+mod group;
 mod state;
 
 use bincode::Options;
@@ -132,7 +133,11 @@ fn error_exit(msg : String) -> !
 
 fn load_config(path : &str) -> Result<Config, String>
 {
-    serde_json::from_reader::<_, Config>(read_file(&path)).map_err(|e| e.to_string())
+    let mut config = serde_json::from_reader::<_, Config>(read_file(&path)).map_err(|e| e.to_string())?;
+
+    config.validate()?;
+
+    Ok(config)
 }
 
 fn maybe_read_file(path : &str) -> Option<Box<dyn std::io::Read>>
