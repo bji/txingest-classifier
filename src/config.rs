@@ -4,7 +4,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub struct LeaderSlotsClassification
 {
-    pub group_name : String,
+    pub group_name : Option<String>,
 
     pub leader_slots : u64
 }
@@ -84,9 +84,13 @@ impl Config
 // Must be called immediately after deserialization.  Validates that the LeaderSlotsClassification has rational values.
 impl LeaderSlotsClassification
 {
-    pub fn validate(&self) -> Result<(), String>
+    pub fn validate(&mut self) -> Result<(), String>
     {
-        if self.group_name == "" {
+        if self.group_name.is_none() {
+            self.group_name = Some("outside_leader_slots".to_string());
+        }
+
+        if self.group_name.as_ref().unwrap() == "" {
             return Err("Invalid outside_leader_slots group name: empty string".to_string());
         }
 

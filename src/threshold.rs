@@ -105,6 +105,12 @@ impl Threshold
             self.group_name = Some(classification_group_name.to_string());
         }
 
+        if self.group_name.as_ref().unwrap() == "" {
+            return Err(format!(
+                "Classification {classification_name} has threshold at index {threshold_index} with empty group_name"
+            ));
+        }
+
         if self.group_expiration_seconds.is_none() {
             self.group_expiration_seconds = Some(classification_group_expiration_seconds);
         }
